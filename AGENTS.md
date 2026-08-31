@@ -53,8 +53,11 @@ Tests are split into two independent layers, both driven by `just`.
 ### Integration Tests
 
 `tests/test-runner.sh` runs `.github/workflows/test-opengrep-action.yml`
-locally through `act` using the pinned `catthehacker/ubuntu:act-22.04` image
-and `act v0.2.69`.
+locally through `act v0.2.69`, using `opengrep-action-act:local` — a thin layer
+over the pinned `catthehacker/ubuntu:act-22.04` image that adds packages the
+act image lacks but GitHub-hosted runners have (see `tests/act/Dockerfile`).
+Build it with `just build-act-image`; `just setup` and `just dev-setup` do it
+for you, and `just check` warns when it is missing.
 
 Named jobs include:
 
@@ -84,7 +87,8 @@ Use `just` for day-to-day tasks. See `justfile` for the full list.
 
 ```bash
 just dev-setup           # one-time setup: act, Docker image, dirs
-just check               # verify Docker, act, jq, action.yml
+just build-act-image     # rebuild the local act runner image
+just check               # verify Docker, act, jq, action.yml, act image
 just status              # detailed environment report
 
 just test-basic          # fastest smoke test via act
@@ -136,15 +140,20 @@ conventional commits by `pre-release.yml` and `release.yml`.
 
 ## Release
 
-`scripts/release.sh` backs the `just release-*` recipes. Version bumps are
-driven by conventional commits:
+`scripts/release.sh` backs the `just release-*` recipes.
 
-- `feat:` -> minor
-- `fix:` -> patch
-- `feat!:` or `BREAKING CHANGE:` -> major
+The version bump is **chosen by a human**, not derived from commit history.
+`pre-release.yml` takes `version_type` (patch/minor/major/prerelease/custom)
+as a workflow input and `calculate_next_version` does arithmetic on the latest
+tag. Nothing parses `feat!:` or `BREAKING CHANGE:` — writing one does not
+produce a major release on its own.
+
+Conventional commit prefixes matter only for changelog grouping, which buckets
+on the anchored subject (`^feat`, `^fix`, `^security`, `^docs`, `^test`, and
+everything else under "Other").
 
 Major-version floating tags such as `v1` and `v2` are force-pushed on release.
-See `RELEASE.md` for details.
+See `RELEASE.md` for what warrants which bump.
 
 ## Editing Rules
 

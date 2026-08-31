@@ -5,7 +5,12 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      # Semver tags only. 'v*' also matched the floating major tags
+      # (v1, v2) that update-major-version-tag creates, so any manual
+      # push or move of one started a release run that then died in
+      # validate-tag. The workflow's own pushes are masked because
+      # GITHUB_TOKEN does not re-trigger workflows; a human's are not.
+      - 'v*.*.*'
 
 permissions:
   contents: read
@@ -18,7 +23,7 @@ jobs:
       is-prerelease: ${{ steps.extract-version.outputs.is-prerelease }}
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40
         with:
           egress-policy: audit
 
@@ -27,7 +32,14 @@ jobs:
         env:
           REF_NAME: ${{ github.ref_name }}
         run: |
-          if [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9-]+)?$ ]]; then
+          # Prerelease suffixes are dot-separated identifiers, per semver:
+          # v2.0.1-rc.1, v1.0.0-beta.1. The previous class was [a-zA-Z0-9-]
+          # with no dot, so it rejected every dotted suffix — including the
+          # examples in the error message below, the ones documented in
+          # RELEASE.md, and the versions pre-release.yml actually generates
+          # (it appends ".1" to the chosen suffix). The two release workflows
+          # therefore disagreed about what a valid prerelease looked like.
+          if [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
             echo "Valid tag format: $REF_NAME"
             VERSION="$REF_NAME"
             echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -48,35 +60,91 @@ jobs:
   run-tests:
     runs-on: ubuntu-latest
     needs: validate-tag
-    strategy:
-      matrix:
-        os: [ubuntu-latest, ubuntu-20.04]
-        test-type: [basic, integration, security]
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40
         with:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          # bats-core is vendored as a submodule at tests/unit/bats. Without
+          # this the runner below is simply absent and the step exits 127.
+          submodules: recursive
           persist-credentials: false
 
-      - name: Install just
-        uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6
+      - name: Run validator unit tests
+        run: tests/unit/bats/bin/bats tests/unit/
 
-      - name: Run ${{ matrix.test-type }} tests on ${{ matrix.os }}
+      - name: Create release test fixture
         run: |
-          just test-${{ matrix.test-type }}
+          source tests/helpers/format-output-validation.sh
+          create_format_fixture test-code/release-format
+
+      - name: Run release basic scan
+        id: release-basic
+        uses: ./
+        with:
+          target: 'test-code/release-format/src/'
+          patterns: 'test-code/release-format/rules.yml'
+          output-format: 'json/sarif'
+          strict: 'false'
+
+      - name: Verify release basic scan
+        run: |
+          set -euo pipefail
+          source tests/helpers/format-output-validation.sh
+          assert_format_json_finding "${STEPS_BASIC_OUTPUTS_JSON_FILE}"
+          assert_format_sarif_finding "${STEPS_BASIC_OUTPUTS_SARIF_FILE}"
+        env:
+          STEPS_BASIC_OUTPUTS_JSON_FILE: ${{ steps.release-basic.outputs.json-file }}
+          STEPS_BASIC_OUTPUTS_SARIF_FILE: ${{ steps.release-basic.outputs.sarif-file }}
+
+      - name: Run release integration scan
+        id: release-integration
+        uses: ./
+        with:
+          target: 'test-code/'
+          patterns: 'auto'
+          output-format: 'json/sarif'
+          strict: 'false'
+
+      - name: Verify release integration scan
+        run: |
+          set -euo pipefail
+          source tests/helpers/format-output-validation.sh
+          assert_valid_json_file "${STEPS_INTEGRATION_OUTPUTS_JSON_FILE}"
+          assert_valid_sarif_file "${STEPS_INTEGRATION_OUTPUTS_SARIF_FILE}"
+        env:
+          STEPS_INTEGRATION_OUTPUTS_JSON_FILE: ${{ steps.release-integration.outputs.json-file }}
+          STEPS_INTEGRATION_OUTPUTS_SARIF_FILE: ${{ steps.release-integration.outputs.sarif-file }}
+
+      - name: Run release invalid input check
+        id: invalid
+        uses: ./
+        continue-on-error: true
+        with:
+          target: '../../etc/passwd'
+          strict: 'false'
+
+      - name: Verify release invalid input was rejected
+        run: |
+          [ "${STEPS_INVALID_OUTCOME}" = "failure" ] || {
+            echo "Expected validation failure, got ${STEPS_INVALID_OUTCOME}"
+            exit 1
+          }
+        env:
+          STEPS_INVALID_OUTCOME: ${{ steps.invalid.outcome }}
 
       - name: Upload test results
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: test-results-${{ matrix.os }}-${{ matrix.test-type }}
+          name: test-results-native
           path: |
             test-results/
+            opengrep-results/
             *.log
             *.sarif
             *.json
@@ -89,12 +157,12 @@ jobs:
       contents: read
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40
         with:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -103,7 +171,11 @@ jobs:
         uses: ./
         with:
           target: '.'
-          patterns: 'security,secrets,owasp-top-10'
+          # `patterns` accepts 'auto', or a path to a rules file/directory.
+          # Anything else is passed through as --pattern (-e), which opengrep
+          # rejects without a matching -l/--lang. A comma-separated ruleset
+          # list was never a supported shape and failed every release.
+          patterns: 'auto'
           severity: 'INFO'
           output-format: 'json/sarif'
           verbose: 'true'
@@ -122,7 +194,7 @@ jobs:
           STEPS_RELEASE_SCAN_OUTPUTS_SARIF_FILE: ${{ steps.release-scan.outputs.sarif-file }}
 
       - name: Upload security scan results
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
           name: security-scan-results
@@ -136,12 +208,12 @@ jobs:
     needs: [validate-tag, run-tests, security-scan]
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40
         with:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -170,7 +242,7 @@ jobs:
           sha512sum opengrep-action-${NEEDS_VALIDATE_TAG_OUTPUTS_VERSION}.tar.gz >> checksums.txt
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: release-package
           path: |
@@ -185,18 +257,18 @@ jobs:
       contents: write
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40
         with:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Download build artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: release-package
 
@@ -213,37 +285,83 @@ jobs:
 
           if [ -z "$PREVIOUS_TAG" ]; then
             echo "No previous tag found, using initial commit"
-            PREVIOUS_TAG=$(git rev-list --max-parents=0 HEAD)
+            PREVIOUS_TAG=$(git rev-list --max-parents=0 "$REF_NAME" | tail -n1)
           fi
 
-          echo "Generating changelog from $PREVIOUS_TAG to $CURRENT_VERSION"
+          # Resolve the commit range.
+          #
+          # `git log A..B` silently degrades to "everything reachable from B"
+          # when A is not an ancestor of B, which turns one stale tag into a
+          # changelog that re-lists the project's entire history. v1.0.0 is
+          # exactly that case here: it is its own root commit and shares no
+          # ancestry with main (`git merge-base` exits 1), left behind by a
+          # rebase. Detect it and fall back to this branch's own root so the
+          # notes stay bounded instead of quietly wrong.
+          if git merge-base --is-ancestor "$PREVIOUS_TAG" "$REF_NAME" 2>/dev/null; then
+            RANGE_START="$PREVIOUS_TAG"
+          elif MERGE_BASE=$(git merge-base "$PREVIOUS_TAG" "$REF_NAME" 2>/dev/null); then
+            printf '::warning::%s is not an ancestor of %s; using merge-base %s\n' \
+              "$PREVIOUS_TAG" "$REF_NAME" "$MERGE_BASE"
+            RANGE_START="$MERGE_BASE"
+          else
+            RANGE_START=$(git rev-list --max-parents=0 "$REF_NAME" | tail -n1)
+            printf '::warning::%s shares no history with %s; listing from root %s\n' \
+              "$PREVIOUS_TAG" "$REF_NAME" "$RANGE_START"
+          fi
 
-          # Generate changelog
+          echo "Generating changelog from $RANGE_START to $CURRENT_VERSION"
+
+          # Bucket commits by conventional-commit type.
+          #
+          # Matches the subject only, anchored, allowing an optional scope and
+          # the breaking-change marker; merges are excluded and there is no
+          # result cap. Kept in step with pre-release.yml and
+          # scripts/release.sh — all three previously used unanchored greps
+          # over the whole commit message, which filed a single commit under
+          # several headings at once.
+          KNOWN='^(feat|fix|security|docs|test)(\([^)]+\))?!?:'
+
+          bucket() {
+            # bucket <extended-regex> [invert]; prints "- <subject>" lines.
+            local flag="-E"
+            [ "${2:-}" = "invert" ] && flag="-Ev"
+            git log --no-merges --pretty='%s' "${RANGE_START}..${REF_NAME}" \
+              | grep "$flag" "$1" | sed 's/^/- /' || true
+          }
+
+          # Build the commit sections separately from the template below.
+          #
+          # The template heredoc must stay *quoted*: its body contains
+          # markdown code fences, and in an unquoted heredoc those backticks
+          # are command substitution. That is why the static parts use
+          # __PLACEHOLDER__ substitution rather than direct expansion — and
+          # why the previous `$(git log ...)` calls inside it never ran, and
+          # shipped as literal text in the published release body.
+          SECTIONS=$(cat <<SECTIONS_EOF
+          ### Features
+          $(bucket '^feat(\([^)]+\))?!?:')
+
+          ### Bug Fixes
+          $(bucket '^fix(\([^)]+\))?!?:')
+
+          ### Security
+          $(bucket '^security(\([^)]+\))?!?:')
+
+          ### Documentation
+          $(bucket '^docs(\([^)]+\))?!?:')
+
+          ### Testing
+          $(bucket '^test(\([^)]+\))?!?:')
+
+          ### Other Changes
+          $(bucket "$KNOWN" invert)
+          SECTIONS_EOF
+          )
+
           CHANGELOG=$(cat << 'EOF'
           ## What's Changed
 
-          ### Features
-          $(git log --oneline ${PREVIOUS_TAG}..${REF_NAME} --grep="feat\|feature" --pretty="- %s" | head -20)
-
-          ### Bug Fixes
-          git log --oneline ${PREVIOUS_TAG}..${REF_NAME} \
-            --grep="fix\|bug" --pretty="- %s" | head -20
-
-          ### Security
-          git log --oneline ${PREVIOUS_TAG}..${REF_NAME} \
-            --grep="security\|sec\|vuln" --pretty="- %s" | head -10
-
-          ### Documentation
-          git log --oneline ${PREVIOUS_TAG}..${REF_NAME} \
-            --grep="doc\|docs\|readme" --pretty="- %s" | head -10
-
-          ### Testing
-          git log --oneline ${PREVIOUS_TAG}..${REF_NAME} \
-            --grep="test\|spec" --pretty="- %s" | head -10
-
-          ### Other Changes
-          git log --oneline ${PREVIOUS_TAG}..${REF_NAME} \
-            --grep="chore\|refactor\|style\|perf" --pretty="- %s" | head -10
+          __SECTIONS__
 
           **Full Changelog**: https://github.com/__REPO__/compare/__PREVIOUS_TAG__..__VERSION__
 
@@ -254,7 +372,7 @@ jobs:
             uses: __REPO__@__VERSION__
             with:
               target: 'src/'
-              patterns: 'security'
+              patterns: 'auto'
               severity: 'WARNING'
           ```
 
@@ -274,16 +392,35 @@ jobs:
           ```
           EOF
           )
+          CHANGELOG="${CHANGELOG//__SECTIONS__/$SECTIONS}"
           CHANGELOG="${CHANGELOG//__REPO__/$GITHUB_REPOSITORY}"
           CHANGELOG="${CHANGELOG//__PREVIOUS_TAG__/$PREVIOUS_TAG}"
           CHANGELOG="${CHANGELOG//__VERSION__/$NEEDS_VALIDATE_TAG_OUTPUTS_VERSION}"
 
           # Save changelog to file and output
           echo "$CHANGELOG" > release_notes.md
+
+          # A curated RELEASE_NOTES.md wins over the generated changelog.
+          #
+          # pre-release.yml writes that file into the preparation PR, which is
+          # the point at which a human can edit the notes. Without this the
+          # file was committed and then ignored, so hand-edits never reached
+          # the published release. Require it to name the version being
+          # released so a stale file from an earlier release cannot leak in.
+          if [ -f RELEASE_NOTES.md ] \
+            && grep -qF "$NEEDS_VALIDATE_TAG_OUTPUTS_VERSION" RELEASE_NOTES.md; then
+            printf '::notice::Using curated RELEASE_NOTES.md for %s\n' \
+              "$NEEDS_VALIDATE_TAG_OUTPUTS_VERSION"
+            cp RELEASE_NOTES.md release_notes.md
+          elif [ -f RELEASE_NOTES.md ]; then
+            printf '::warning::RELEASE_NOTES.md does not mention %s; using generated notes\n' \
+              "$NEEDS_VALIDATE_TAG_OUTPUTS_VERSION"
+          fi
+
           echo "changelog-file=release_notes.md" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
         with:
           tag_name: ${{ needs.validate-tag.outputs.version }}
           name: Release ${{ needs.validate-tag.outputs.version }}
@@ -305,16 +442,25 @@ jobs:
       contents: write
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40
         with:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
           persist-credentials: false
+
+      # `git tag -a` writes a tagger line and so needs an identity. The runner
+      # has none configured, which failed this job with "empty ident name" on
+      # every release; the floating major tag has therefore never existed,
+      # despite RELEASE.md describing it as part of the contract.
+      - name: Configure Git
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
 
       - name: Update major version tag
         env:
@@ -345,7 +491,7 @@ jobs:
     if: always() && needs.create-release.result == 'success'
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40
         with:
           egress-policy: audit
 
@@ -360,7 +506,7 @@ jobs:
           NEEDS_VALIDATE_TAG_OUTPUTS_VERSION: ${{ needs.validate-tag.outputs.version }}
 
       - name: Post-release security scan
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 

@@ -25,19 +25,19 @@ jobs:
 
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40
         with:
           egress-policy: audit
 
       - name: Checkout Code
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
       # Default json/sarif output scan (JSON + SARIF)
       - name: Run OpenGrep Dual Output Scan
         id: dual-scan
-        uses: ./  # Use local action, or replace with platform-sec/opengrep-action@LATEST_SHA256_HASH
+        uses: ./  # Use local action, or replace with platform-sec/opengrep-action@<REPLACE-WITH-COMMIT-SHA>
         continue-on-error: true  # Findings are reported below without failing the workflow
         with:
           target: '.'
@@ -74,7 +74,7 @@ jobs:
       # Upload both files as artifacts (optional)
       - name: Upload Scan Results
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: opengrep-results
           path: |
@@ -85,7 +85,7 @@ jobs:
       # Single format scan with verified OpenGrep features
       - name: Run OpenGrep Single Format Scan with Verified Features
         id: single-scan
-        uses: ./  # Use local action, or replace with platform-sec/opengrep-action@LATEST_SHA256_HASH
+        uses: ./  # Use local action, or replace with platform-sec/opengrep-action@<REPLACE-WITH-COMMIT-SHA>
         with:
           patterns: 'auto'  # Use the curated default rule set
           target: '.'
@@ -105,7 +105,7 @@ jobs:
       # Example of conditional upload (only on main branch)
       - name: Upload Security Results (Main Branch Only)
         if: always() && github.ref == 'refs/heads/main' && steps.single-scan.outputs.results-file != ''
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: security-scan-main
           path: ${{ steps.single-scan.outputs.results-file }}
@@ -113,7 +113,7 @@ jobs:
 
       # Scan with custom rules file
       - name: Run OpenGrep with Custom Rules
-        uses: ./  # Use local action, or replace with platform-sec/opengrep-action@LATEST_SHA256_HASH
+        uses: ./  # Use local action, or replace with platform-sec/opengrep-action@<REPLACE-WITH-COMMIT-SHA>
         continue-on-error: true  # Keep this reporting workflow advisory when findings exist
         with:
           config: '.semgrep.yml'
@@ -131,12 +131,12 @@ jobs:
 
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40
         with:
           egress-policy: audit
 
       - name: Checkout Code
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -172,12 +172,12 @@ jobs:
 
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40
         with:
           egress-policy: audit
 
       - name: Checkout Code
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -226,7 +226,7 @@ jobs:
 
       - name: Upload Custom Report
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: security-report
           path: security-report.md
@@ -237,12 +237,12 @@ jobs:
 
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40
         with:
           egress-policy: audit
 
       - name: Checkout Code
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0  # Fetch full history for baseline comparison
           persist-credentials: false

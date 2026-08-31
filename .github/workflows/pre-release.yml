@@ -42,20 +42,21 @@ jobs:
   prepare-release:
     runs-on: ubuntu-latest
     permissions:
+      # No pull-requests scope: this job pushes a branch and prints a link,
+      # it never touches the PR API.
       contents: write
-      pull-requests: write
       actions: read
     outputs:
       new-version: ${{ steps.version.outputs.new-version }}
       changelog: ${{ steps.changelog.outputs.changelog }}
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40
         with:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -134,15 +135,48 @@ jobs:
           echo "new-version=$NEW_VERSION" >> $GITHUB_OUTPUT
           echo "Calculated new version: $NEW_VERSION"
 
-      - name: Install just
-        uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6
-
-      - name: Run pre-release tests
+      - name: Create pre-release fixture
         run: |
-          echo "🧪 Running pre-release test suite..."
-          just test-basic
-          just test-integration
-          echo "✅ All tests passed"
+          source tests/helpers/format-output-validation.sh
+          create_format_fixture test-code/pre-release-format
+
+      - name: Run pre-release basic scan
+        id: pre-release-basic
+        uses: ./
+        with:
+          target: 'test-code/pre-release-format/src/'
+          patterns: 'test-code/pre-release-format/rules.yml'
+          output-format: 'json/sarif'
+          strict: 'false'
+
+      - name: Verify pre-release basic scan
+        run: |
+          set -euo pipefail
+          source tests/helpers/format-output-validation.sh
+          assert_format_json_finding "${STEPS_BASIC_OUTPUTS_JSON_FILE}"
+          assert_format_sarif_finding "${STEPS_BASIC_OUTPUTS_SARIF_FILE}"
+        env:
+          STEPS_BASIC_OUTPUTS_JSON_FILE: ${{ steps.pre-release-basic.outputs.json-file }}
+          STEPS_BASIC_OUTPUTS_SARIF_FILE: ${{ steps.pre-release-basic.outputs.sarif-file }}
+
+      - name: Run pre-release integration scan
+        id: pre-release-integration
+        uses: ./
+        with:
+          target: 'test-code/'
+          patterns: 'auto'
+          output-format: 'json/sarif'
+          strict: 'false'
+
+      - name: Verify pre-release integration scan
+        run: |
+          set -euo pipefail
+          source tests/helpers/format-output-validation.sh
+          assert_valid_json_file "${STEPS_INTEGRATION_OUTPUTS_JSON_FILE}"
+          assert_valid_sarif_file "${STEPS_INTEGRATION_OUTPUTS_SARIF_FILE}"
+        env:
+          STEPS_INTEGRATION_OUTPUTS_JSON_FILE: ${{ steps.pre-release-integration.outputs.json-file }}
+          STEPS_INTEGRATION_OUTPUTS_SARIF_FILE: ${{ steps.pre-release-integration.outputs.sarif-file }}
 
       - name: Generate changelog
         id: changelog
@@ -152,27 +186,47 @@ jobs:
 
           echo "Generating changelog from $CURRENT_VERSION to $NEW_VERSION"
 
+          # Bucket commits by conventional-commit type.
+          #
+          # Match the *subject only*, anchored, with the optional scope and
+          # breaking-change marker. `git log --grep` searches the whole message
+          # and is unanchored, which put one commit in four sections at once
+          # and filed every merge commit under Security because the org name
+          # contains "sec".
+          KNOWN='^(feat|fix|security|docs|test)(\([^)]+\))?!?:'
+
+          bucket() {
+            # bucket <extended-regex> [invert]; prints "- <subject>" lines.
+            # Pipe git directly rather than through a variable: printf on an
+            # empty subject list emits a blank line, which survives an
+            # inverted match and renders as a stray "- " entry.
+            local flag="-E"
+            [ "${2:-}" = "invert" ] && flag="-Ev"
+            git log --no-merges --pretty='%s' "${CURRENT_VERSION}..HEAD" \
+              | grep "$flag" "$1" | sed 's/^/- /' || true
+          }
+
           # shellcheck disable=SC2086,SC2129
           CHANGELOG=$(cat << EOF
           ## Changes in $NEW_VERSION
 
           ### 🚀 New Features
-          $(git log --oneline ${CURRENT_VERSION}..HEAD --grep="feat\|feature" --pretty="- %s")
+          $(bucket '^feat(\([^)]+\))?!?:')
 
           ### 🐛 Bug Fixes
-          $(git log --oneline ${CURRENT_VERSION}..HEAD --grep="fix\|bug" --pretty="- %s")
+          $(bucket '^fix(\([^)]+\))?!?:')
 
           ### 🔒 Security Updates
-          $(git log --oneline ${CURRENT_VERSION}..HEAD --grep="security\|sec\|vuln" --pretty="- %s")
+          $(bucket '^security(\([^)]+\))?!?:')
 
           ### 📝 Documentation
-          $(git log --oneline ${CURRENT_VERSION}..HEAD --grep="doc\|docs" --pretty="- %s")
+          $(bucket '^docs(\([^)]+\))?!?:')
 
           ### 🧪 Testing
-          $(git log --oneline ${CURRENT_VERSION}..HEAD --grep="test" --pretty="- %s")
+          $(bucket '^test(\([^)]+\))?!?:')
 
           ### Other Changes
-          $(git log --oneline ${CURRENT_VERSION}..HEAD --grep="chore\|refactor\|style" --pretty="- %s")
+          $(bucket "$KNOWN" invert)
           EOF
           )
 
@@ -198,35 +252,88 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           STEPS_VERSION_OUTPUTS_NEW_VERSION: ${{ steps.version.outputs.new-version }}
 
-      - name: Create release preparation PR (if create_release is false)
+      - name: Prepare release branch (if create_release is false)
         if: github.event.inputs.create_release == 'false'
         run: |
+          set -euo pipefail
+
           NEW_VERSION="${STEPS_VERSION_OUTPUTS_NEW_VERSION}"
           BRANCH_NAME="release/prepare-$NEW_VERSION"
-
-          # Create preparation branch
-          git checkout -b "$BRANCH_NAME"
+          BASE_SHA="$(git rev-parse HEAD)"
 
           # Usage examples are pinned to full commit SHAs; release prep should
           # not rewrite them to mutable version tags.
 
           # Create release notes file
           printf '%s\n' "$STEPS_CHANGELOG_OUTPUTS_CHANGELOG" > RELEASE_NOTES.md
-          git add RELEASE_NOTES.md
 
-          # Commit changes
-          git commit -m "Prepare release $NEW_VERSION" || echo "No changes to commit"
+          # Commit through createCommitOnBranch rather than `git commit`.
+          #
+          # main requires signed commits. A shell commit here is authored by
+          # the workflow with no signature, so the preparation PR could only
+          # ever be squash-merged — and merging it any other way is blocked.
+          # Commits created through this mutation are signed by GitHub.
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BRANCH_NAME}" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH_NAME}" \
+              -f sha="$BASE_SHA" -F force=true >/dev/null
+          else
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/heads/${BRANCH_NAME}" -f sha="$BASE_SHA" >/dev/null
+          fi
 
-          # Push branch
-          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$BRANCH_NAME"
+          read -r -d '' mutation <<'GRAPHQL' || true
+          mutation($input: CreateCommitOnBranchInput!) {
+            createCommitOnBranch(input: $input) {
+              commit { url }
+            }
+          }
+          GRAPHQL
 
-          # Create PR
-          gh pr create \
-            --title "🚀 Prepare release $NEW_VERSION" \
-            --body "This PR prepares the release for $NEW_VERSION.
+          commit_url=$(jq -n \
+            --arg query "$mutation" \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg branch "$BRANCH_NAME" \
+            --arg headline "chore: prepare release $NEW_VERSION" \
+            --arg oid "$BASE_SHA" \
+            --arg notes "$(base64 -w0 RELEASE_NOTES.md)" \
+            '{
+              query: $query,
+              variables: {
+                input: {
+                  branch: {
+                    repositoryNameWithOwner: $repo,
+                    branchName: $branch
+                  },
+                  message: {headline: $headline},
+                  expectedHeadOid: $oid,
+                  fileChanges: {
+                    additions: [{path: "RELEASE_NOTES.md", contents: $notes}]
+                  }
+                }
+              }
+            }' \
+            | gh api graphql --input - \
+              --jq '.data.createCommitOnBranch.commit.url')
+
+          printf 'Created signed commit: %s\n' "$commit_url"
+
+          # Emit a link instead of opening the PR from CI.
+          #
+          # GITHUB_TOKEN cannot create pull requests here: the repository has
+          # "Allow GitHub Actions to create and approve pull requests" off, and
+          # it stays off deliberately — that single toggle also grants Actions
+          # the ability to *approve* PRs, which would undercut any review
+          # requirement later added to main.
+          #
+          # Opening the PR from CI would be the wrong outcome even if it were
+          # permitted: events raised by GITHUB_TOKEN do not start new workflow
+          # runs, so the release PR would carry no CI results at all. A PR
+          # opened by a human gets the full check suite.
+          pr_title="🚀 Prepare release $NEW_VERSION"
+          pr_body="This PR prepares the release for $NEW_VERSION.
 
           ## Changes
-          ${STEPS_CHANGELOG_OUTPUTS_CHANGELOG}
+          The generated changelog is committed as \`RELEASE_NOTES.md\` — review it in the diff.
 
           ## Next Steps
           1. Review the changes
@@ -238,9 +345,23 @@ jobs:
           \`\`\`bash
           git tag -a $NEW_VERSION -m \"Release $NEW_VERSION\"
           git push origin $NEW_VERSION
-          \`\`\`" \
-            --base main \
-            --head "$BRANCH_NAME"
+          \`\`\`"
+
+          server="${GITHUB_SERVER_URL:-https://github.com}"
+          pr_url="${server}/${GITHUB_REPOSITORY}/compare/main...${BRANCH_NAME}?expand=1"
+          pr_url="${pr_url}&title=$(printf '%s' "$pr_title" | jq -sRr @uri)"
+          pr_url="${pr_url}&body=$(printf '%s' "$pr_body" | jq -sRr @uri)"
+
+          {
+            printf '## 🚀 Release %s prepared\n\n' "$NEW_VERSION"
+            printf "Branch \`%s\` is pushed with a signed commit.\n\n" "$BRANCH_NAME"
+            printf '**[→ Open the pull request](%s)**\n\n' "$pr_url"
+            printf 'The form is pre-filled; opening it as yourself is what makes CI run.\n\n'
+            printf '<details><summary>Generated changelog</summary>\n\n%s\n\n</details>\n' \
+              "$STEPS_CHANGELOG_OUTPUTS_CHANGELOG"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          printf 'Open the PR: %s\n' "$pr_url"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -253,7 +374,7 @@ jobs:
     needs: prepare-release
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40
         with:
           egress-policy: audit
 
@@ -274,7 +395,8 @@ jobs:
             release_tag="${NEEDS_PREPARE_RELEASE_OUTPUTS_NEW_VERSION}"
             echo "- 📦 Release will be available at: $release_url/$release_tag" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "- 📝 Preparation PR created" >> "$GITHUB_STEP_SUMMARY"
+            echo "- 📝 Preparation branch pushed with a signed commit" >> "$GITHUB_STEP_SUMMARY"
+            echo "- 🔗 Open the PR via the link in the \`prepare-release\` summary" >> "$GITHUB_STEP_SUMMARY"
             echo "- 🔍 Review the PR and merge when ready" >> "$GITHUB_STEP_SUMMARY"
             echo "- 🏷️ Create tag manually to trigger release" >> "$GITHUB_STEP_SUMMARY"
           fi
